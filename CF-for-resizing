@@ -1,0 +1,145 @@
+AWSTemplateFormatVersion: 2010-09-09
+
+Resources:
+  ImageBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      AccessControl: PublicRead
+      BucketName: !Sub 'image-resize-${AWS::AccountId}-${AWS::Region}'
+    DeletionPolicy: Retain
+
+  ImageBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref ImageBucket
+      PolicyDocument:
+        Statement:
+          - Action:
+              - 's3:GetObject'
+            Effect: Allow
+            Principal: '*'
+            Resource: !Sub 'arn:aws:s3:::${ImageBucket}/*'
+          - Action:
+              - 's3:PutObject'
+            Effect: Allow
+            Principal:
+              AWS: !GetAtt EdgeLambdaRole.Arn
+            Resource: !Sub 'arn:aws:s3:::${ImageBucket}/*'
+          - Action:
+              - 's3:GetObject'
+            Effect: Allow
+            Principal:
+              AWS: !GetAtt EdgeLambdaRole.Arn
+            Resource: !Sub 'arn:aws:s3:::${ImageBucket}/*'
+
+  EdgeLambdaRole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: 'Allow'
+            Principal:
+              Service:
+                - 'lambda.amazonaws.com'
+                - 'edgelambda.amazonaws.com'
+            Action:
+              - 'sts:AssumeRole'
+      Path: '/service-role/'
+      ManagedPolicyArns:
+        - 'arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole'
+
+  ViewerRequestFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Code: s3://resizing-images-bucket/viewer-request-function.zip
+      Handler: index.handler
+      Runtime: nodejs6.10
+      MemorySize: 128
+      Timeout: 1
+      Role: !GetAtt EdgeLambdaRole.Arn
+
+  OriginResponseFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Code: s3://resizing-images-bucket/origin-response-function.zip
+      Handler: index.handler
+      Runtime: nodejs6.10
+      MemorySize: 512
+      Timeout: 5
+      Role: !GetAtt EdgeLambdaRole.Arn
+
+  GetLambdaFunctionARNs:
+    Type: 'AWS::Lambda::Function'
+    Properties:
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+
+          def lambda_handler(event, context):
+              client = boto3.client('lambda')
+              response = client.get_function(
+                  FunctionName=event['ResourceProperties']['FunctionName']
+              )
+              return {
+                  'Arn': response['Configuration']['FunctionArn']
+              }
+      Handler: index.lambda_handler
+      Role: !GetAtt EdgeLambdaRole.Arn
+      Timeout: 30
+
+  GetViewerRequestFunctionArn:
+    Type: 'Custom::GetFunctionArn'
+    Properties:
+      ServiceToken: !GetAtt GetLambdaFunctionARNs.Arn
+      FunctionName: !Ref ViewerRequestFunction
+
+  GetOriginResponseFunctionArn:
+    Type: 'Custom::GetFunctionArn'
+    Properties:
+      ServiceToken: !GetAtt GetLambdaFunctionARNs.Arn
+      FunctionName: !Ref OriginResponseFunction
+
+  MyDistribution:
+    Type: AWS::CloudFront::Distribution
+    Properties:
+      DistributionConfig:
+        Origins:
+          - DomainName: !Sub '${ImageBucket}.s3.amazonaws.com'
+            Id: myS3Origin
+            S3OriginConfig: {}
+        Enabled: 'true'
+        Comment: 'distribution for content delivery'
+        DefaultRootObject: index.html
+        DefaultCacheBehavior:
+          TargetOriginId: myS3Origin
+          LambdaFunctionAssociations:
+            - EventType: 'viewer-request'
+              LambdaFunctionARN: !GetAtt GetViewerRequestFunctionArn.Arn
+            - EventType: 'origin-response'
+              LambdaFunctionARN: !GetAtt GetOriginResponseFunctionArn.Arn
+          ForwardedValues:
+            QueryString: 'true'
+            QueryStringCacheKeys:
+              - d
+            Cookies:
+              Forward: 'none'
+          ViewerProtocolPolicy: allow-all
+          MinTTL: '100'
+          SmoothStreaming: 'false'
+          Compress: 'true'
+        PriceClass: PriceClass_All
+        ViewerCertificate:
+          CloudFrontDefaultCertificate: 'true'
+
+Outputs:
+  ImageBucket:
+    Value: !Ref ImageBucket
+    Export:
+      Name: !Sub '${AWS::StackName}-ImageBucket'
+
+  MyDistribution:
+    Value: !Ref MyDistribution
+    Export:
+      Name: !Sub '${AWS::StackName}-MyDistribution'
